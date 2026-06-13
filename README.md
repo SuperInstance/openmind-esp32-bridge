@@ -1,69 +1,118 @@
-# openmind-esp32-bridge
+# OpenMind ESP32 Bridge
 
-*Bridge between openmind and ESP32 microcontrollers. Run ternary agents on bare metal — 279 bytes of ternary lookup, 8ns per operation, 520KB of RAM.*
+**OpenMind ESP32 Bridge** is a Rust motor-neuron bridge connecting the OpenMind muscle memory system to ESP32 hardware. It provides a typed RPC interface over serial (UART/USB) and WebSocket transports with CRC-8 framed packets and ternary GPIO semantics {-1: low, 0: floating, +1: high}.
 
-## Why This Exists
+## Why It Matters
 
-The ultimate test of a portable agent framework: can it run on a microcontroller? The ESP32 has 520KB of RAM, a 240MHz dual-core processor, and no operating system. If openmind can bridge to this, it can bridge to anything.
+The ESP32 is the world's most popular IoT microcontroller — $4, WiFi+BLE, dual-core. Robotics, agriculture, and industrial sensing all run on it. But high-level AI agent frameworks have no way to directly actuate physical hardware. This bridge closes that loop: an OpenMind conductor can `flex("gpio_write", pin, Trit::PlusOne)` to set a pin high, or `flex("adc_read", pin)` to read analog sensors. The CRC-8 framing ensures data integrity over noisy serial lines, and the ternary GPIO model maps directly to the SuperInstance ternary ecosystem.
 
-This crate provides the serial and WebSocket transport layers, command framing, type marshaling, and the conductor that orchestrates openmind sessions over the wire. The ESP32 runs the ternary firmware; this crate runs on the host side, translating between openmind's Python API and the ESP32's binary protocol.
+## How It Works
 
-## Architecture
+### Frame Protocol
 
+All communication uses framed packets with CRC-8-SMBUS integrity checking:
+
+**Command frame (host → ESP32):**
 ```
-openmind (Python) ──→ openmind-esp32-bridge (Rust) ──→ Serial/WebSocket ──→ ESP32
-                            ↓                              ↓
-                      Command framing              Binary protocol
-                      Type marshaling               Trit packing
-                      Conductor orchestration       Response parsing
+[0xAA] [len:u16 LE] [cmd:u8] [payload...] [crc:u8] [0x55]
 ```
 
-### Modules
+**Response frame (ESP32 → host):**
+```
+[0xBB] [len:u16 LE] [status:u8] [payload...] [crc:u8] [0x55]
+```
 
-- **`types`** — Shared types: Trit, Command, Response, BridgeError
-- **`framing`** — Binary frame encoding/decoding for the serial protocol
-- **`transport`** — Abstract transport trait (serial + WebSocket implementations)
-- **`serial`** — Serial port transport (UART over USB)
-- **`websocket`** — WebSocket transport (for remote/headless ESP32s)
-- **`registry`** — Command registry (maps command names to handlers)
-- **`conductor`** — Top-level orchestration: manage sessions, route commands, handle errors
+CRC computation: **O(N)** per frame (N = payload bytes). Maximum payload: 1024 bytes.
 
-### Key Types
+### Transport Abstraction
 
-- **`Esp32Bridge`** — The conductor. Connect, send commands, receive responses.
-- **`FlexArg`** / **`FlexResult`** — Dynamic argument/result types for arbitrary commands
-- **`Command`** / **`Response`** — Framed message types
-
-## Usage
+The `Transport` trait abstracts the physical connection:
 
 ```rust
-use openmind_esp32_bridge::*;
-
-// Connect via serial
-let mut bridge = Esp32Bridge::connect_serial("/dev/ttyUSB0", 115200)?;
-
-// Send a ternary operation
-let result = bridge.execute(Command::TernaryOp {
-    op: "eval",
-    args: vec![FlexArg::Trits(vec![1, -1, 0, 1])],
-})?;
-
-match result {
-    Response::TritResult(trits) => println!("Result: {:?}", trits),
-    Response::Error(msg) => eprintln!("ESP32 error: {}", msg),
-    _ => {}
+#[async_trait]
+trait Transport {
+    async fn send_and_recv(&cmd: &Command) -> Result<Response>;
 }
 ```
 
-## The Deeper Idea
+Two implementations:
+- **SerialTransport**: tokio-serial with configurable baud, timeout (default 5s), retries (default 2)
+- **WsTransport**: tokio-tungstenite with auto-reconnect
 
-The ESP32 bridge proves that the ternary agent architecture is hardware-agnostic. The same ternary logic that runs on an RTX 4050 (6GB VRAM, 20 SMs) also runs on an ESP32 (520KB RAM, 2 cores). The math doesn't change. The representation doesn't change. Only the transport does.
+Serial transport includes exponential backoff retry logic. On failure after max retries, returns `BridgeError::Serial`.
 
-This connects to `ternary-esp32-firmware` (the ESP32-side firmware) and `open-mind-standalone` (the Python agent framework). Together they form the full loop: Python agent → Rust bridge → ESP32 firmware → bare metal ternary computation.
+### Chord Registry
 
-## Related Crates
+The bridge uses a static `LazyLock<Vec<Chord>>` registry mapping named operations to command IDs:
 
-- `ternary-esp32-firmware` — The ESP32 firmware (the other end of this bridge)
-- `open-mind-standalone` — Python agent framework that uses this bridge
-- `flux-core` — FLUX bytecode (alternative execution path for agent logic)
-- `pincher` — Agent reflexes that can be compiled for ESP32
+| Chord | cmd_id | Params | Return |
+|-------|--------|--------|--------|
+| `gpio_read` | 0x01 | u8 (pin) | Trit |
+| `gpio_write` | 0x02 | u8, Trit | — |
+| `spi_transfer` | 0x03 | bytes | bytes |
+| `i2c_read` | 0x04 | u8, u8, usize | bytes |
+| `i2c_write` | 0x05 | u8, u8, bytes | — |
+| `pwm_set` | 0x06 | u8, u16 | — |
+| `adc_read` | 0x07 | u8 | u16 |
+| `uart_write` | 0x08 | bytes | — |
+
+Argument validation: **O(N)** where N = parameter count. Serialization: little-endian byte packing.
+
+### Ternary GPIO
+
+GPIO pins use ternary logic instead of binary:
+- `Trit::MinusOne` (byte 0x00): Pin LOW
+- `Trit::Zero` (byte 0x01): Pin FLOATING (high-impedance)
+- `Trit::PlusOne` (byte 0x02): Pin HIGH
+
+This maps to the three-state logic used in digital electronics and matches the SuperInstance ternary digit set.
+
+## Quick Start
+
+```rust
+use openmind_esp32_bridge::{Esp32Bridge, FlexArg, Trit};
+
+#[tokio::main]
+async fn main() {
+    let bridge = Esp32Bridge::serial("/dev/ttyUSB0", 115200).await.unwrap();
+
+    // Read GPIO pin 2
+    let result = bridge.flex("gpio_read", &[FlexArg::U8(2)]).await.unwrap();
+
+    // Write GPIO pin 4 HIGH
+    bridge.flex("gpio_write", &[FlexArg::U8(4), FlexArg::Trit(Trit::PlusOne)]).await.unwrap();
+
+    // Read analog ADC pin 34
+    let adc = bridge.flex("adc_read", &[FlexArg::U8(34)]).await.unwrap();
+}
+```
+
+## API
+
+| Type | Description |
+|------|-------------|
+| `Esp32Bridge` | High-level bridge with `flex()` method |
+| `Transport` | Async trait for serial/WebSocket/mock transports |
+| `Command` | cmd_id + payload bytes |
+| `Response` | status + payload bytes |
+| `FlexArg` | Enum: `U8`, `U16`, `Usize`, `Bytes`, `String`, `Trit` |
+| `Trit` | MinusOne, Zero, PlusOne |
+| `framing::encode_command()` | Frame a command with CRC |
+| `framing::decode_response()` | Parse and verify a response frame |
+| `BridgeError` | Serial, WebSocket, Frame, CrcMismatch, DeviceError, etc. |
+
+## Architecture Notes
+
+The ESP32 Bridge is the motor cortex of the OpenMind system in SuperInstance. In γ + η = C, it executes γ (growth — actuating motors and sensors to interact with the physical world) and η (avoidance — the ternary GPIO -1 state actively drives pins low for safety). The bridge connects to `openmind-conductor` via the baton protocol and uses muscle memory patterns for learned hardware sequences.
+
+See [ARCHITECTURE.md](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md) for the OpenMind hardware architecture.
+
+## References
+
+1. Kolban, N. (2018). *Kolban's Book on ESP32*. Leanpub.
+2. ANSI X3.4-1967. "Cyclic Redundancy Check (CRC-8-SMBUS) Specification."
+3. Tokio Project (2024). "Asynchronous Serial Ports in Rust with tokio-serial."
+
+## License
+
+MIT
